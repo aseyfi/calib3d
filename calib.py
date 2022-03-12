@@ -332,7 +332,7 @@ def ml_optmize(imgpoints, objpoints, fx, fy, cx, cy, alpha, k, rvec, tvec):
         if change < 1e-10:
             break
 
-    print(np.sqrt(np.mean(ex**2)))
+    print(np.mean(np.linalg.norm(ex, axis = 1)))
     return fx, fy, cx, cy, alpha, k, rvec, tvec
 
 def sparse_ml_optmize(imgpoints, objpoints, fx, fy, cx, cy, alpha, k, rvec, tvec):
@@ -463,8 +463,255 @@ def draw_corners(img, imgpt):
 
     return image
 
+def comp_fisheye_distortion(pt, k):
+    # input: image points normalized to fx=fy=1, cx=cy=0
+    # ouput: points with no fisheye distortion effect
+    theta_d = np.linalg.norm(pt, axis = 1).reshape(-1,1)
+    # solve equation theta_d = theta * (1 + k[0]*theta^2 + k[1]*theta^2 + k[2]*theta^6 + k[3]*theta^8)
+    # Theta can be formulated as a function of thera as follows:
+    # theta = theta_d /(1 + k[0]*theta^2 + k[1]*theta^4 + k[2]*theta^6 + k[3]*theta^8)
+    # theta(K+1) = theta_d /(1 + k[0]*theta(k)^2 + k[1]*theta(k)^4 + k[2]*theta(k)^6 + k[3]*theta(k)^8)
+    # where theta(k+1) and theta(k) are theta at itteration K+1 and k respectively.
+    theta = theta_d # initial value
+
+    for i in range(20):
+        theta = theta_d /(1 + k[0]*theta**2 + k[1]*theta**4 + k[2]*theta**6 + k[3]*theta**8)
+
+    scaling = np.tan(theta)/theta_d
+    return scaling * pt
+
+def normalize_pixel_fisheye(imgpt,fx, fy, cx, cy, alpha, k):
+    pt_distort_x = (imgpt[:,0] - cx)/fx; pt_distort_x = pt_distort_x.reshape(-1,1)
+    pt_distort_y = (imgpt[:,1] - cy)/fy; pt_distort_y = pt_distort_y.reshape(-1,1)
+    pt_distort = np.hstack((pt_distort_x, pt_distort_y))
+    # undo skew
+    pt_distort[:,0] = pt_distort[:,0] - alpha * pt_distort[:,1]
+    # remove fisheye distortiion effect
+    pt_normalized = comp_fisheye_distortion(pt_distort, k)
+    return pt_normalized
+
+def compute_extrinsic_init_fisheye(imgpt, objpt, fx, fy, cx, cy, alpha, k):
+    # normaliize points to points on a plane at Z = 1
+    # or fx=fy= 0, cx=cy= 0, alpha= 0
+    imgpt_n = normalize_pixel_fisheye(imgpt,fx, fy, cx, cy, alpha, k)
+    # Assuming Planar Structure:
+    H = homography_2d(objpt[:,:2], imgpt_n[:,:2])
+
+    # from end of section 3.1 of paper
+    # camera matrix is an identity matrix, because image points are normalized,
+    # r1 = lambda * inv(A) * h1 = lambda * h1, I think setting norm(r1) = 1 will normalize for lambda
+    # r2 = lambda * inv(A) * h2 = lambda * h2 = h2
+    # r3 = r1 * r2
+
+    r1 = H[:,0] / np.linalg.norm(H[:,0])
+    r2 = H[:,1] / np.linalg.norm(H[:,1])
+    r3 = np.cross(r1, r2)
+    R = np.hstack((r1.reshape(3,1), r2.reshape(3,1), r3.reshape(3,1)))
+    # Paper: R does not in general satisfy the properties of a rotation matrix.
+    # Appendix C describes a method to estimate the best rotation matrix from a general 3 x 3 matrix
+    # Bouguet is converting to rot vector and then back to rot matrix
+    # ToDo: See appendix C of the paper
+    rotvec, _ = cv.Rodrigues(R)
+    #R, _ = cv.Rodrigues(rotvec)
+
+    # It seems norm of h1 and h2 are different.
+    # To calculate T we need lambda which is calculated as 1/norm(h1) = 1/norm(h2)
+    # This is what Bouguet is doing for plumb bob model, but not for fisheye.
+    # I am doing the same for fishey too:
+    lam =  1 / np.mean(np.linalg.norm(H[:,:2], axis = 0))
+    T = lam * H[:,2].reshape(3,1)
+    return (rotvec.reshape(-1), T.reshape(-1))
+
+def project_points_fisheye(objpt, fx, fy, cx, cy, alpha, k, rvec, t):
+    #xx = a * (1 + kc(1)*r^2 + kc(2)*r^4 + kc(5)*r^6)      +      2*kc(3)*a*b + kc(4)*(r^2 + 2*a^2);
+    #yy = b * (1 + kc(1)*r^2 + kc(2)*r^4 + kc(5)*r^6)      +      kc(3)*(r^2 + 2*b^2) + 2*kc(4)*a*b;
+    R, _ = cv.Rodrigues(rvec)
+    X = np.matrix(R) * np.matrix(objpt).T + t.reshape(3,1)
+    X = np.array(X)
+    x  = X[0,:]
+    y  = X[1,:]
+    z  = X[2,:]
+    a = x / z
+    b = y / z
+    r = np.sqrt(a**2 + b**2)
+    theta = np.arctan(r)
+    theta_d =  theta * (1 + k[0]*theta**2 + k[1]*theta**4 + k[2]*theta**6 + k[3]*theta**8)
+
+    xx = (theta_d / r) * a
+    yy = (theta_d / r) * b
+
+    xxp = fx * (xx + alpha * yy) + cx
+    yyp = fy * (yy) + cy
+
+    return np.hstack((xxp.reshape(-1,1), yyp.reshape(-1,1)))
+
+
+def project_points_jacobian_fisheye(objpt, fx, fy, cx, cy, alpha, k, rvec, t):
+    def params_to_list(fx, fy, cx, cy, alpha, k, rvec, t):
+        params = [fx] + [fy] + [cx] + [cy] + [alpha]
+        params.extend(k.reshape(-1).tolist())
+        params.extend(rvec.reshape(-1).tolist())
+        params.extend(t.reshape(-1).tolist())
+        return params
+
+    def list_to_params(params):
+        fx, fy, cx, cy, alpha = params[0:5]
+        k = params[5:9]
+        rvec = params[9:12]
+        t = params[12:]
+        return fx, fy, cx, cy, alpha, np.array(k), np.array(rvec), np.array(t)
+
+    delta = 1e-8
+    params = params_to_list(fx, fy, cx, cy, alpha, k, rvec, t)
+
+    J = []
+    for i in range(len(params)):
+        params1 = list(params)
+        params1[i] -= delta
+        params2 = list(params)
+        params2[i] += delta
+        uv1 = project_points_fisheye(objpt, *list_to_params(params1))
+        uv2 = project_points_fisheye(objpt, *list_to_params(params2))
+        J_i = (uv2 - uv1)/(2 * delta)
+        J.append(J_i.reshape(-1,1)) # row 1 = du/d., row2 = dv/d.
+
+    J = np.hstack(tuple(J))
+    return J
+
+
+def compute_extrinsic_refine_fisheye(imgpt, objpt, fx, fy, cx, cy, alpha, k, rvec_init, t_init):
+
+    rvec = rvec_init
+    t = t_init
+    params = []
+    params.extend(rvec.reshape(-1).tolist())
+    params.extend(t.reshape(-1).tolist())
+    params = np.array(params)
+
+
+    for i in range(10):
+        projected_imgpt = project_points_fisheye(objpt, fx, fy, cx, cy, alpha, k, rvec, t)
+        J = project_points_jacobian_fisheye(objpt, fx, fy, cx, cy, alpha, k, rvec, t)
+        # We are only optimizing for rvec and t, so we only need those columns
+        JJ = np.matrix(J[:, 9:])
+
+        # Optimization:
+        # https://en.wikipedia.org/wiki/Gauss%E2%80%93Newton_algorithm
+        ex = (imgpt - projected_imgpt).reshape(-1,1) # row 1 = u error, row2 = v error
+
+        # calculate innovation
+        JJ2 = JJ.T * JJ
+        param_innov = np.array(np.linalg.inv(JJ2) * JJ.T * ex).reshape(-1)
+        param_up = params + param_innov
+        change = np.linalg.norm(param_innov)/np.linalg.norm(param_up)
+        params = param_up
+        rvec = np.array(params[:3]).reshape(-1)
+        t = np.array(params[3:]).reshape(-1)
+        if change < 1e-6:
+            break
+
+    return(rvec, t)
+
+def comp_ext_calib_fisheye(imgpoints, objpoints, fx, fy, cx, cy, alpha, k):
+    tc = []
+    omc = []
+    for imgpt, objpt in zip(imgpoints, objpoints):
+        # format image and board 2D points
+        imgpt = imgpt.reshape(-1,2)
+        objpt = objpt.reshape(-1,3)
+        (rvec, t) = compute_extrinsic_init_fisheye(imgpt, objpt, fx, fy, cx, cy, alpha, k)
+        # The paper says: The above solution is obtained through minimizing an algebraic distance which is not
+        # physically meaningful. We can refine it through maximum likelihood inference.
+        # Bouguet is doing the same.
+        (rvec, t) = compute_extrinsic_refine_fisheye(imgpt, objpt, fx, fy, cx, cy, alpha, k, rvec, t)
+        tc.append(t)
+        omc.append(rvec)
+
+    return omc, tc
+
+
+def ml_optmize_fisheye(imgpoints, objpoints, fx, fy, cx, cy, alpha, k, rvec, tvec):
+    # main optimization
+    print('Gradient descent iterations')
+    # Initialize parameters
+    params = [fx] + [fy] + [cx] + [cy] + [alpha]
+    params.extend(k.reshape(-1).tolist())
+    len_int = len(params)
+    len_ext = 6
+    for n in range(len(objpoints)):
+        params.extend(rvec[n].reshape(-1).tolist())
+        params.extend(tvec[n].reshape(-1).tolist())
+
+    params = np.array(params)
+
+    n_planes = len(objpoints)
+    n_rows_per_plane = len(objpoints[0]) * 2
+
+    # main optimization loop
+    for ii in range(20):
+        fx = params[0]
+        fy = params[1]
+        cx = params[2]
+        cy = params[3]
+        alpha = params[4]
+        k = params[5:9]
+
+        ex = np.zeros((n_planes * n_rows_per_plane, 1))
+        JJ = np.zeros((n_planes * n_rows_per_plane, len_int + len_ext * n_planes)) # 10 intrinsic and 6 * N extrinsics
+
+        for n in range(n_planes):
+            # update extrinsic parameters
+            ext_params = params[len_int + len_ext * n:len_int + len_ext * (n+1)]
+            rvec[n] = rvec_n = ext_params[:3]
+            tvec[n] = tvec_n = ext_params[3:]
+
+            # calculate error and javobian
+            objpt_n = objpoints[n]
+            imgpt_n = imgpoints[n]
+            imgpt_n_prj = project_points_fisheye(objpt_n, fx, fy, cx, cy, alpha, k, rvec_n, tvec_n)
+            J_n = project_points_jacobian_fisheye(objpt_n, fx, fy, cx, cy, alpha, k, rvec_n, tvec_n)
+            ex_n = (imgpt_n - imgpt_n_prj).reshape(-1,1) # row 1 = u error, row2 = v error
+            # Some Sparse optimization by separating parameter vector two bloxks, intrinsic and extrinsic
+            # This method is called The Schur Complement Trick
+            # https://grail.cs.washington.edu/projects/bal/bal.pdf
+            # Starting with a non-efficient version
+            ex[n * n_rows_per_plane :(n + 1) * n_rows_per_plane] = ex_n
+            JJ[n * n_rows_per_plane :(n + 1) * n_rows_per_plane, :len_int] = J_n[:,:len_int]
+            JJ[n * n_rows_per_plane :(n + 1) * n_rows_per_plane, len_int + len_ext * n:len_int + len_ext * (n+1)] = J_n[:,len_int:]
+
+        #visualize_jacobian(JJ
+        # calculate innovation
+        JJ = np.matrix(JJ)
+        JJ2 = JJ.T * JJ
+        param_innov = np.array(np.linalg.inv(JJ2) * JJ.T * ex).reshape(-1)
+        param_up = params + param_innov
+        change = np.linalg.norm(param_innov)/np.linalg.norm(param_up)
+        params = param_up
+        if change < 1e-10:
+            break
+
+    print(np.mean(np.linalg.norm(ex, axis = 1)))
+    return fx, fy, cx, cy, alpha, k, rvec, tvec
+
+
+def go_calib_optim_iter_fisheye(imgpoints, objpoints, (ny, nx)):
+    # Initialize intrinsics
+    #fx = fy = np.max((ny, nx)) / np.pi
+    fx = 300.0
+    fy = 300.0
+
+    cx = (nx - 1) / 2.0
+    cy = (ny - 1) / 2.0
+    alpha = 0.0
+    k = np.array([0.0,0,0,0])
+
+    # initialize extrinsics
+    rvec, tvec = comp_ext_calib_fisheye(imgpoints, objpoints, fx, fy, cx, cy, alpha, k)
+    fx, fy, cx, cy, alpha, k, rvec, tvec = ml_optmize_fisheye(imgpoints, objpoints, fx, fy, cx, cy, alpha, k, rvec, tvec)
+    return fx, fy, cx, cy, alpha, k, rvec, tvec
+
 def main():
-    params = {'board_size' : (8,11), 'vis_detection': False}
+    params = {'board_size' : (8,11), 'vis_detection': False, 'model':'fisheye'}
     criteria = (cv.TERM_CRITERIA_EPS + cv.TERM_CRITERIA_MAX_ITER, 30, 0.001)
 
     # Generate Object Points
@@ -474,8 +721,8 @@ def main():
     objp = objp.reshape(-1,1,3)
 
     # Load the images
-    img_dir = 'sample_images/AR0144_narrow_fov'
-
+    #img_dir = 'sample_images/AR0144_narrow_fov'
+    img_dir = 'sample_images/AR0144_fisheye'
     # Arrays to store object points and image points from all the images.
     objpoints = [] # 3d point in real world space
     imgpoints = [] # 2d points in image plane.
@@ -500,23 +747,42 @@ def main():
             if cv.waitKey(0) & 0xFF == ord('q'):
                 sys.exit(0)
 
-    fx, fy, cx, cy, alpha, k, rvec, tvec = go_calib_optim_iter(imgpoints, objpoints, gray.shape)
+    if params['model'] == 'plumb_bob':
+        fx, fy, cx, cy, alpha, k, rvec, tvec = go_calib_optim_iter(imgpoints, objpoints, gray.shape)
 
-    print('fx = %s' %fx)
-    print('fy = %s' %fy)
-    print('cx = %s' %cx)
-    print('cy = %s' %cy)
-    print('skew = %s' %alpha)
-    print('k = %s' %k.tolist())
+        print('fx = %s' %fx)
+        print('fy = %s' %fy)
+        print('cx = %s' %cx)
+        print('cy = %s' %cy)
+        print('skew = %s' %alpha)
+        print('k = %s' %k.tolist())
 
-    for pt3d, r, t, img in zip(objpoints, rvec, tvec, images):
-        pt2d_projected = project_points(pt3d, fx, fy, cx, cy, alpha, k, r, t)
-        image = draw_corners(img, pt2d_projected)
-        cv.imshow("IMG", image)
-        key = cv.waitKey(0)
-        if key == ord('q'):
-            cv.destroyAllWindows()
-            sys.exit(0)
+        for pt3d, r, t, img in zip(objpoints, rvec, tvec, images):
+            pt2d_projected = project_points(pt3d, fx, fy, cx, cy, alpha, k, r, t)
+            image = draw_corners(img, pt2d_projected)
+            cv.imshow("IMG", image)
+            key = cv.waitKey(0)
+            if key == ord('q'):
+                cv.destroyAllWindows()
+                sys.exit(0)
+
+    elif params['model'] == 'fisheye':
+        fx, fy, cx, cy, alpha, k, rvec, tvec = go_calib_optim_iter_fisheye(imgpoints, objpoints, gray.shape)
+        print('fx = %s' %fx)
+        print('fy = %s' %fy)
+        print('cx = %s' %cx)
+        print('cy = %s' %cy)
+        print('skew = %s' %alpha)
+        print('k = %s' %k.tolist())
+
+        for pt3d, r, t, img in zip(objpoints, rvec, tvec, images):
+            pt2d_projected = project_points_fisheye(pt3d, fx, fy, cx, cy, alpha, k, r, t)
+            image = draw_corners(img, pt2d_projected)
+            cv.imshow("IMG", image)
+            key = cv.waitKey(0)
+            if key == ord('q'):
+                cv.destroyAllWindows()
+                sys.exit(0)
 
 if __name__ == "__main__":
     main()
