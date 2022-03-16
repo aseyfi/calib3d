@@ -5,10 +5,49 @@ import numpy as np
 import glob
 import sys
 
+def Rodrigues(v):
+    # rotation vecctor input
+    if len(v.shape) == 1:
+        v = v.reshape(3,1)
+        theta = np.linalg.norm(v)
+        u = v/theta
+        u_x, u_y, u_z = u
+        u_cross = np.array([[0, -u_z, u_y],[u_z, 0, -u_x],[-u_y, u_x, 0]])
+        uuT = np.dot(u, u.T)
+        # Calculate rotation matrix
+        R = np.cos(theta) * np.eye(3) + np.sin(theta) * u_cross + (1 - np.cos(theta)) * uuT
+
+        # Calculate jacobian
+        A = np.zeros((4,3), dtype = float)
+        A[0,0] = A[1,1] = A[2,2] = 1
+        A[3,:] = u.T
+
+        B = np.zeros((4,4), dtype = float)
+        B[0,0] = B[1,1] = B[2,2] = 1/theta
+        B[0:3,3] = -u.reshape(-1)/theta
+        B[3,3] = 1
+        #print(A)
+
+        dRdu_x = np.sin(theta) * np.array([0, 0, 0, 0, 0, -1, 0, 1, 0], dtype = float).reshape(-1,1)
+        dRdu_x = dRdu_x + (1 - np.cos(theta)) * np.array([2 * u_x, u_y, u_z, u_y, 0, 0, u_z, 0, 0], dtype = float).reshape(-1,1)
+
+        dRdu_y = np.sin(theta) * np.array([0, 0, 1, 0, 0, 0, -1, 0, 0], dtype = float).reshape(-1,1)
+        dRdu_y = dRdu_y + (1 - np.cos(theta)) * np.array([0, u_x, 0, u_x, 2 * u_y, u_z, 0, u_z, 0], dtype = float).reshape(-1,1)
+
+        dRdu_z = np.sin(theta) * np.array([0, -1, 0, 1, 0, 0, 0, 0, 0], dtype = float).reshape(-1,1)
+        dRdu_z = dRdu_z + (1 - np.cos(theta)) * np.array([0, 0, u_x, 0, 0, u_y, u_x, u_y, 2 * u_z], dtype = float).reshape(-1,1)
+
+        dRdtheta = -np.sin(theta) * np.eye(3).reshape(-1,1) + np.cos(theta) *  u_cross.reshape(-1,1) + np.sin(theta) * uuT.reshape(-1,1)
+
+        J_int = np.dot(B, A)
+        J = np.dot(np.hstack((dRdu_x, dRdu_y, dRdu_z, dRdtheta)), J_int)
+
+        return R, J
+
 def project_points(objpt, fx, fy, cx, cy, alpha, k, rvec, t):
     #xx = a * (1 + kc(1)*r^2 + kc(2)*r^4 + kc(5)*r^6)      +      2*kc(3)*a*b + kc(4)*(r^2 + 2*a^2);
     #yy = b * (1 + kc(1)*r^2 + kc(2)*r^4 + kc(5)*r^6)      +      kc(3)*(r^2 + 2*b^2) + 2*kc(4)*a*b;
-    R, _ = cv.Rodrigues(rvec)
+    R, _ = Rodrigues(rvec)
     X = np.matrix(R) * np.matrix(objpt).T + t.reshape(3,1)
     X = np.array(X)
     x  = X[0,:]
@@ -525,7 +564,7 @@ def compute_extrinsic_init_fisheye(imgpt, objpt, fx, fy, cx, cy, alpha, k):
 def project_points_fisheye(objpt, fx, fy, cx, cy, alpha, k, rvec, t):
     #xx = a * (1 + kc(1)*r^2 + kc(2)*r^4 + kc(5)*r^6)      +      2*kc(3)*a*b + kc(4)*(r^2 + 2*a^2);
     #yy = b * (1 + kc(1)*r^2 + kc(2)*r^4 + kc(5)*r^6)      +      kc(3)*(r^2 + 2*b^2) + 2*kc(4)*a*b;
-    R, _ = cv.Rodrigues(rvec)
+    R, _ = Rodrigues(rvec)
     X = np.matrix(R) * np.matrix(objpt).T + t.reshape(3,1)
     X = np.array(X)
     x  = X[0,:]
