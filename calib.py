@@ -47,21 +47,116 @@ def Rodrigues(v):
 def project_points(objpt, fx, fy, cx, cy, alpha, k, rvec, t):
     #xx = a * (1 + kc(1)*r^2 + kc(2)*r^4 + kc(5)*r^6)      +      2*kc(3)*a*b + kc(4)*(r^2 + 2*a^2);
     #yy = b * (1 + kc(1)*r^2 + kc(2)*r^4 + kc(5)*r^6)      +      kc(3)*(r^2 + 2*b^2) + 2*kc(4)*a*b;
-    R, _ = Rodrigues(rvec)
-    X = np.matrix(R) * np.matrix(objpt).T + t.reshape(3,1)
-    X = np.array(X)
-    x  = X[0,:]
-    y  = X[1,:]
-    z  = X[2,:]
-    a = x / z
-    b = y / z
-    r = np.sqrt(a**2 + b**2)
-    xx = a * (1 + k[0] * r**2 + k[1] * r**4 + k[4] * r**6) + 2 * k[2] * a * b + k[3] * (r**2 + 2 * a**2)
-    yy = b * (1 + k[0] * r**2 + k[1] * r**4 + k[4] * r**6) + k[2] * (r**2 + 2 * b**2) + 2 * k[3] * a * b
-    xxp = fx * (xx + alpha * yy) + cx
-    yyp = fy * (yy) + cy
+    objpt = objpt.reshape(-1,3)
+    num_pt = objpt.shape[0]
 
-    return np.hstack((xxp.reshape(-1,1), yyp.reshape(-1,1)))
+    R, JR = Rodrigues(rvec)
+    r1 = R[0,:].reshape(3,1)
+    r2 = R[1,:].reshape(3,1)
+    r3 = R[2,:].reshape(3,1)
+
+    d_r1__d_v = JR[0:3,:]
+    d_r2__d_v = JR[3:6,:]
+    d_r3__d_v = JR[6:9,:]
+
+    # calculate object points in camera coordinate frame
+    tx, ty, tz = t
+    xc = (np.dot(r1.T, objpt.T) + tx).reshape(-1,1)
+    yc = (np.dot(r2.T, objpt.T) + ty).reshape(-1,1)
+    zc = (np.dot(r3.T, objpt.T) + tz).reshape(-1,1)
+
+    d_xc__d_v = np.dot(objpt, d_r1__d_v)
+    d_yc__d_v = np.dot(objpt, d_r2__d_v)
+    d_zc__d_v = np.dot(objpt, d_r3__d_v)
+    d_xc__d_t = np.zeros_like(objpt); d_xc__d_t[:,0] = 1
+    d_yc__d_t = np.zeros_like(objpt); d_yc__d_t[:,1] = 1
+    d_zc__d_t = np.zeros_like(objpt); d_zc__d_t[:,2] = 1
+
+    # Normalized image points
+    xp = (xc/zc).reshape(-1,1)
+    yp = (yc/zc).reshape(-1,1)
+
+    d_xp__d_v = 1/zc * (d_xc__d_v - xp * d_zc__d_v)
+    d_yp__d_v = 1/zc * (d_yc__d_v - yp * d_zc__d_v)
+    d_xp__d_t = 1/zc * (d_xc__d_t - xp * d_zc__d_t)
+    d_yp__d_t = 1/zc * (d_yc__d_t - yp * d_zc__d_t)
+
+    # Calculate distance from center r
+    r = np.sqrt(xp**2 + yp**2)
+
+    d_r__d_v = 1/r * (xp * d_xp__d_v + yp * d_yp__d_v)
+    d_r__d_t = 1/r * (xp * d_xp__d_t + yp * d_yp__d_t)
+
+    # Effect of distortion
+    k1, k2, p1, p2, k3 = k
+    r2 = r * r
+    r3 = r2 * r
+    r4 = r3 * r
+    r5 = r4 * r
+    r6 = r5 * r
+
+    q1 = (1 + k1 * r2 + k2 * r4 + k3 * r6)
+    q2 = xp * yp
+    q3 = r2 + 2 * xp**2
+    q4 = r2 + 2 * yp**2
+
+    d_q1__d_k = np.zeros((num_pt, k.shape[0]))
+    d_q1__d_k[:,0] = r2.reshape(-1)
+    d_q1__d_k[:,1] = r4.reshape(-1)
+    d_q1__d_k[:,-1] = r6.reshape(-1)
+    d_q1__d_v = (2 * k1 * r + 4 * k2 * r3 + 6 * k3 * r5) * d_r__d_v
+    d_q1__d_t = (2 * k1 * r + 4 * k2 * r3 + 6 * k3 * r5) * d_r__d_t
+
+    d_q2__d_v = yp * d_xp__d_v + xp * d_yp__d_v
+    d_q2__d_t = yp * d_xp__d_t + xp * d_yp__d_t
+
+    d_q3__d_v = 2 * r * d_r__d_v + 4 * xp * d_xp__d_v
+    d_q3__d_t = 2 * r * d_r__d_v + 4 * xp * d_xp__d_t
+
+    d_q4__d_v = 2 * r * d_r__d_v + 4 * yp * d_yp__d_v
+    d_q4__d_t = 2 * r * d_r__d_t + 4 * yp * d_yp__d_t
+
+    # Apply distortion
+    xpp = xp * q1 + 2 * p1 * q2 + p2 * q3
+    ypp = yp * q1 + p1 * q4 + 2 * p2 * q2
+
+    d_xpp__d_k = xp * d_q1__d_k + 2 * q2 * np.array([0, 0, 1 , 0, 0]).reshape(1,-1) + q3 * np.array([0, 0, 0, 1, 0]).reshape(1,-1)
+    d_xpp__d_v = q1 * d_xp__d_v + xp * d_q1__d_v + 2 * p1 * d_q2__d_v + p2 * d_q3__d_v
+    d_xpp__d_t = q1 * d_xp__d_t + xp * d_q1__d_t + 2 * p1 * d_q2__d_t + p2 * d_q3__d_t
+
+
+    d_ypp__d_k = yp * d_q1__d_k + q4 * np.array([0, 0, 1 , 0, 0]).reshape(1,-1) + 2 * q2 * np.array([0, 0, 0, 1, 0]).reshape(1,-1)
+    d_ypp__d_v = q1 * d_yp__d_v + yp * d_q1__d_v + p1 * d_q4__d_v + 2 * p2 * d_q2__d_v
+    d_ypp__d_t = q1 * d_yp__d_t + yp * d_q1__d_t + p1 * d_q4__d_t + 2 * p2 * d_q2__d_t
+
+    # Image coordinates
+    xm = fx * xpp + alpha * ypp + cx
+    ym = fy * ypp + cy
+
+    d_xm__d_fx = xpp
+    d_xm__d_fy = np.zeros_like(d_xm__d_fx)
+    d_xm__d_cx = np.ones_like(xpp)
+    d_xm__d_cy = np.zeros_like(d_xm__d_cx)
+    d_xm__d_alpha = ypp
+    d_xm__d_k = fx * d_xpp__d_k + alpha * d_ypp__d_k
+    d_xm__d_v = fx * d_xpp__d_v + alpha * d_ypp__d_v
+    d_xm__d_t = fx * d_xpp__d_t + alpha * d_ypp__d_t
+
+    d_ym__d_fy = ypp
+    d_ym__d_fx = np.zeros_like(d_ym__d_fy)
+    d_ym__d_cy = np.ones_like(ypp)
+    d_ym__d_cx = np.zeros_like(d_ym__d_cy)
+    d_ym__d_alpha = np.zeros_like(ypp)
+    d_ym__d_k = fy * d_ypp__d_k
+    d_ym__d_v = fy * d_ypp__d_v
+    d_ym__d_t = fy * d_ypp__d_t
+
+    J_xm = np.hstack((d_xm__d_fx, d_xm__d_fy, d_xm__d_cx, d_xm__d_cy, d_xm__d_alpha, d_xm__d_k, d_xm__d_v, d_xm__d_t))
+    J_ym = np.hstack((d_ym__d_fx, d_ym__d_fy, d_ym__d_cx, d_ym__d_cy, d_ym__d_alpha, d_ym__d_k, d_ym__d_v, d_ym__d_t))
+    J = np.hstack((J_xm, J_ym))
+    J = J.reshape(J_xm.shape[0] * 2, J_xm.shape[1])
+
+    return np.hstack((xm.reshape(-1,1), ym.reshape(-1,1))), J
 
 
 def project_points_jacobian(objpt, fx, fy, cx, cy, alpha, k, rvec, t):
@@ -88,8 +183,8 @@ def project_points_jacobian(objpt, fx, fy, cx, cy, alpha, k, rvec, t):
         params1[i] -= delta
         params2 = list(params)
         params2[i] += delta
-        uv1 = project_points(objpt, *list_to_params(params1))
-        uv2 = project_points(objpt, *list_to_params(params2))
+        uv1, _ = project_points(objpt, *list_to_params(params1))
+        uv2, _ = project_points(objpt, *list_to_params(params2))
         J_i = (uv2 - uv1)/(2 * delta)
         J.append(J_i.reshape(-1,1)) # row 1 = du/d., row2 = dv/d.
 
@@ -108,8 +203,8 @@ def compute_extrinsic_refine(imgpt, objpt, fx, fy, cx, cy, alpha, k, rvec_init, 
 
 
     for i in range(10):
-        projected_imgpt = project_points(objpt, fx, fy, cx, cy, alpha, k, rvec, t)
-        J = project_points_jacobian(objpt, fx, fy, cx, cy, alpha, k, rvec, t)
+        projected_imgpt, J = project_points(objpt, fx, fy, cx, cy, alpha, k, rvec, t)
+        #J = project_points_jacobian(objpt, fx, fy, cx, cy, alpha, k, rvec, t)
         # We are only optimizing for rvec and t, so we only need those columns
         JJ = np.matrix(J[:, 10:])
 
@@ -349,8 +444,9 @@ def ml_optmize(imgpoints, objpoints, fx, fy, cx, cy, alpha, k, rvec, tvec):
             # calculate error and javobian
             objpt_n = objpoints[n]
             imgpt_n = imgpoints[n]
-            imgpt_n_prj = project_points(objpt_n, fx, fy, cx, cy, alpha, k, rvec_n, tvec_n)
-            J_n = project_points_jacobian(objpt_n, fx, fy, cx, cy, alpha, k, rvec_n, tvec_n)
+            imgpt_n_prj, J_n = project_points(objpt_n, fx, fy, cx, cy, alpha, k, rvec_n, tvec_n)
+            #J_n = project_points_jacobian(objpt_n, fx, fy, cx, cy, alpha, k, rvec_n, tvec_n)
+            #print(J_test-J_n)
             ex_n = (imgpt_n - imgpt_n_prj).reshape(-1,1) # row 1 = u error, row2 = v error
             # Some Sparse optimization by separating parameter vector two bloxks, intrinsic and extrinsic
             # This method is called The Schur Complement Trick
@@ -413,8 +509,8 @@ def sparse_ml_optmize(imgpoints, objpoints, fx, fy, cx, cy, alpha, k, rvec, tvec
             # calculate error and javobian
             objpt_n = objpoints[n]
             imgpt_n = imgpoints[n]
-            imgpt_n_prj = project_points(objpt_n, fx, fy, cx, cy, alpha, k, rvec_n, tvec_n)
-            J_n = project_points_jacobian(objpt_n, fx, fy, cx, cy, alpha, k, rvec_n, tvec_n)
+            imgpt_n_prj, J_n = project_points(objpt_n, fx, fy, cx, cy, alpha, k, rvec_n, tvec_n)
+            #J_n = project_points_jacobian(objpt_n, fx, fy, cx, cy, alpha, k, rvec_n, tvec_n)
             ex_n = (imgpt_n - imgpt_n_prj).reshape(-1,1) # row 1 = u error, row2 = v error
             # Some Sparse optimization by separating parameter vector two bloxks, intrinsic and extrinsic
             # This method is called The Schur Complement Trick
@@ -750,7 +846,7 @@ def go_calib_optim_iter_fisheye(imgpoints, objpoints, (ny, nx)):
     return fx, fy, cx, cy, alpha, k, rvec, tvec
 
 def main():
-    params = {'board_size' : (8,11), 'vis_detection': False, 'model':'fisheye'}
+    params = {'board_size' : (8,11), 'vis_detection': False, 'model':'plumb_bob'}
     criteria = (cv.TERM_CRITERIA_EPS + cv.TERM_CRITERIA_MAX_ITER, 30, 0.001)
 
     # Generate Object Points
@@ -760,8 +856,8 @@ def main():
     objp = objp.reshape(-1,1,3)
 
     # Load the images
-    #img_dir = 'sample_images/AR0144_narrow_fov'
-    img_dir = 'sample_images/AR0144_fisheye'
+    img_dir = 'sample_images/AR0144_narrow_fov'
+    #img_dir = 'sample_images/AR0144_fisheye'
     # Arrays to store object points and image points from all the images.
     objpoints = [] # 3d point in real world space
     imgpoints = [] # 2d points in image plane.
@@ -797,7 +893,7 @@ def main():
         print('k = %s' %k.tolist())
 
         for pt3d, r, t, img in zip(objpoints, rvec, tvec, images):
-            pt2d_projected = project_points(pt3d, fx, fy, cx, cy, alpha, k, r, t)
+            pt2d_projected, J_test = project_points(pt3d, fx, fy, cx, cy, alpha, k, r, t)
             image = draw_corners(img, pt2d_projected)
             cv.imshow("IMG", image)
             key = cv.waitKey(0)
